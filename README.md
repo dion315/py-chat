@@ -1,63 +1,49 @@
 ## Secure Python Chat
 
-This repository contains a lightweight TLS-enabled chat server and matching client. Multiple users can connect simultaneously, exchange messages, and disconnect safely. Everything is implemented with Python's `asyncio` and `ssl` modules—no external dependencies are required.
+This repository contains a lightweight asyncio chat server and matching client secured with GnuPG-based symmetric encryption. The server generates a fresh pre-shared key at startup, displays it on the console, and every connected client encrypts/decrypts their traffic with that key. Multiple users can connect simultaneously, exchange messages (including `/name NEW_NAME` for renames), and disconnect safely.
 
 ### Requirements
 
-- Python 3.11+ (tested with CPython, but PyPy should also work)
-- A TLS certificate and private key pair hosted on the server
-
-### Generating a Self-Signed Certificate (development only)
-
-You can use OpenSSL to generate a throwaway certificate for local testing:
-
-```bash
-mkdir -p certs
-openssl req -x509 -newkey rsa:4096 -keyout certs/server.key -out certs/server.crt -days 365 -nodes -subj "/CN=localhost"
-```
-
-Copy the resulting `server.crt` to any client machines so they can verify the server's identity.
+- Python 3.11+
+- `gpg` available on the system `PATH`
 
 ### Running the Server
 
 ```bash
-python pychat_server.py --host 0.0.0.0 --port 5000 \
-  --certfile certs/server.crt --keyfile certs/server.key \
-  --psk-file secrets/chat.psk
+python pychat_server.py --host 0.0.0.0 --port 5000
 ```
 
-By default, the server listens on `127.0.0.1:5000`. Press `Ctrl+C` to shut it down gracefully.
+- On launch, the server prints a line like `Session pre-shared key: abc123...`. Copy/paste it to your users.
+- Use `--psk YOUR_KEY` if you prefer to reuse a known key instead of generating a new one each run.
+- Press `Ctrl+C` to shut it down gracefully.
 
 ### Running the Client
 
 ```bash
-python pychat_client.py --host YOUR_SERVER_IP --port 5000 \
-  --cafile certs/server.crt --psk-file secrets/chat.psk
+python pychat_client.py --host YOUR_SERVER_IP --port 5000 --psk COPIED_KEY
 ```
 
-- Each client is prompted for a nickname.
+- Each client is prompted for a nickname, and can later type `/name NEW_NICKNAME` to change it.
 - Type `/quit` to exit cleanly.
-- Provide the same pre-shared key (`--psk` or `--psk-file`) that the server expects.
-- Use `--server-hostname` if the TLS certificate's common name differs from the `--host` value (e.g., connecting via IP).
-- Development-only: pass `--insecure` to skip certificate verification, though this sacrifices the security benefits of TLS.
-- Change your nickname later with `/name NEW_NICKNAME`.
+- The `--psk` flag is required and must match the key printed by the server.
 
-### Pre-Shared Key
+### Pre-Shared Key Details
 
-- Set a strong random value (for example `openssl rand -hex 32 > secrets/chat.psk`) and point both server and client to it.
-- You can pass the key inline with `--psk`, but supplying it via a file (or environment variable that you read yourself) is more secure because it avoids exposing the secret in process listings.
+- Keys default to a fresh random 32-hex-character value every time the server starts.
+- Pass `--psk VALUE` when starting the server to supply your own static key (helpful for automation).
+- Clients always receive the key out-of-band—share it however you prefer (copy/paste, secure messenger, etc.).
 
 ### Automation Helpers
 
-- `scripts/bootstrap.sh` generates a self-signed certificate and random PSK under `certs/` and `secrets/`.
-- `scripts/smoke_test.sh` launches the server and a scripted client to verify TLS + PSK end-to-end.
+- `scripts/bootstrap.sh` simply verifies that `gpg` is installed before you start hacking.
+- `scripts/smoke_test.sh` launches the server, captures the announced key, runs a scripted client session, and tears everything down again.
 
 ### Features
 
-- TLS-secured sockets to prevent eavesdropping and tampering.
-- Broadcast of join/leave events and chat messages to all connected peers.
-- Basic keep-alive logic and graceful shutdown handling.
+- GPG-encrypted message payloads over simple TCP sockets—no TLS certificates required.
+- Server-enforced nickname uniqueness plus `/name` to change identities mid-session.
+- Graceful shutdown of all sockets and a `scripts/smoke_test.sh` check to ensure things keep working.
 
 ### Development Notes
 
-The networking logic lives directly in `pychat_server.py` and `pychat_client.py`. Feel free to extend them with persistence, authentication, or richer chat commands.
+All networking and encryption glue lives in `pychat_server.py`, `pychat_client.py`, and `gpg_utils.py`. Feel free to extend them with authentication, persistence, or richer chat commands.

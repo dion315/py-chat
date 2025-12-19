@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""TLS-enabled multi-client chat server."""
+"""GPG-encrypted multi-client chat server."""
 
 from __future__ import annotations
 
@@ -7,10 +7,11 @@ import argparse
 import asyncio
 import hmac
 import logging
+import secrets
 import signal
-import ssl
-from pathlib import Path
 from typing import Optional
+
+from gpg_utils import GPGError, decrypt_message, encrypt_message, ensure_gpg_available
 
 MAX_MESSAGE_LENGTH = 2048
 MAX_NICKNAME_LENGTH = 32
@@ -24,6 +25,7 @@ class ClientSession:
         self.writer = writer
         self.address = writer.get_extra_info("peername")
         self.name: Optional[str] = None
+        self.secure = False
 
     def __hash__(self) -> int:  # pragma: no cover - relying on object identity
         return id(self)
@@ -70,27 +72,27 @@ class ChatServer:
             await self._drop_client(client)
 
     async def _authenticate(self, client: ClientSession) -> None:
-        await self._send_line(client, "Pre-shared key required:")
+        await self._send_line(client, "Pre-shared key required:", force_plain=True)
         data = await client.reader.readline()
         if not data:
             raise ConnectionError("Client disconnected before providing a pre-shared key.")
         provided = data.decode("utf-8", errors="ignore").strip()
         if not hmac.compare_digest(provided, self._psk):
-            await self._send_line(client, "Invalid pre-shared key. Disconnecting.")
+            await self._send_line(client, "Invalid pre-shared key. Disconnecting.", force_plain=True)
             raise PermissionError("Invalid pre-shared key.")
-        await self._send_line(client, "Pre-shared key accepted.")
+        await self._send_line(client, "Pre-shared key accepted. Secure channel enabled.", force_plain=True)
+        client.secure = True
 
     async def _handle_messages(self, client: ClientSession) -> None:
         assert client.name, "Client should have a nickname before messaging"
         while True:
-            data = await client.reader.readline()
-            if not data:
+            message = await self._read_message(client)
+            if message is None:
                 logging.info("Client %s closed the connection", client.label())
                 break
-
-            message = data.decode("utf-8", errors="ignore").rstrip("\r\n")
             if not message:
                 continue
+
             if len(message) > MAX_MESSAGE_LENGTH:
                 await self._send_line(client, f"Message too long (max {MAX_MESSAGE_LENGTH} characters).")
                 continue
@@ -117,10 +119,10 @@ class ChatServer:
     async def _negotiate_name(self, client: ClientSession) -> str:
         await self._send_line(client, "Choose a nickname:")
         while True:
-            data = await client.reader.readline()
-            if not data:
+            desired = await self._read_message(client)
+            if desired is None:
                 raise ConnectionError("Client disconnected before selecting a nickname.")
-            desired = data.decode("utf-8", errors="ignore").strip()
+            desired = desired.strip()
             error = await self._set_nickname(client, desired)
             if error:
                 await self._send_line(client, f"{error} Try again:")
@@ -133,19 +135,24 @@ class ChatServer:
         if not recipients:
             return
 
-        # Normalize newline handling so every client gets one per message.
-        payload = message if message.endswith("\n") else f"{message}\n"
-        data = payload.encode("utf-8")
         for client in recipients:
             try:
-                client.writer.write(data)
+                await self._send_line(client, message)
             except ConnectionResetError:
                 logging.warning("Dropping client %s due to write failure", client.label())
-        await asyncio.gather(*(c.writer.drain() for c in recipients), return_exceptions=True)
 
-    async def _send_line(self, client: ClientSession, message: str) -> None:
-        payload = message if message.endswith("\n") else f"{message}\n"
-        client.writer.write(payload.encode("utf-8"))
+    async def _send_line(self, client: ClientSession, message: str, *, force_plain: bool = False) -> None:
+        text = message.rstrip("\n")
+        if client.secure and not force_plain:
+            try:
+                payload = encrypt_message(text, self._psk)
+            except GPGError as exc:
+                logging.error("Encryption failed for %s: %s", client.label(), exc)
+                return
+        else:
+            payload = text
+        wire = f"{payload}\n"
+        client.writer.write(wire.encode("utf-8"))
         await client.writer.drain()
 
     async def _drop_client(self, client: ClientSession) -> None:
@@ -176,6 +183,22 @@ class ChatServer:
                 pass
             await self._drop_client(client)
 
+    async def _read_message(self, client: ClientSession) -> Optional[str]:
+        data = await client.reader.readline()
+        if not data:
+            return None
+        raw = data.decode("utf-8", errors="ignore").rstrip("\r\n")
+        if not raw:
+            return ""
+        if client.secure:
+            try:
+                return decrypt_message(raw, self._psk)
+            except GPGError as exc:
+                logging.warning("Failed to decrypt message from %s: %s", client.label(), exc)
+                await self._send_line(client, "Decryption failed. Please resend your message.")
+                return ""
+        return raw
+
     async def _set_nickname(self, client: ClientSession, desired: str) -> Optional[str]:
         desired = desired.strip()
         if not desired:
@@ -192,11 +215,7 @@ class ChatServer:
         return None
 
 
-async def _run_server(host: str, port: int, certfile: str, keyfile: str, psk: str) -> None:
-    ssl_context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
-    ssl_context.minimum_version = ssl.TLSVersion.TLSv1_2
-    ssl_context.load_cert_chain(certfile, keyfile=keyfile)
-
+async def _run_server(host: str, port: int, psk: str) -> None:
     chat_server = ChatServer(psk)
     loop = asyncio.get_running_loop()
     stop_event = asyncio.Event()
@@ -212,7 +231,7 @@ async def _run_server(host: str, port: int, certfile: str, keyfile: str, psk: st
             # Windows falls back to default signal behavior.
             signal.signal(sig, lambda *_: _request_shutdown())
 
-    server = await asyncio.start_server(chat_server.register, host, port, ssl=ssl_context)
+    server = await asyncio.start_server(chat_server.register, host, port)
     sockets = ", ".join(str(sock.getsockname()) for sock in server.sockets or [])
     logging.info("Server listening on %s", sockets)
 
@@ -224,18 +243,12 @@ async def _run_server(host: str, port: int, certfile: str, keyfile: str, psk: st
 
 
 def _parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Secure asyncio chat server.")
+    parser = argparse.ArgumentParser(description="GPG-encrypted asyncio chat server.")
     parser.add_argument("--host", default="127.0.0.1", help="Host/IP to bind (default: 127.0.0.1)")
     parser.add_argument("--port", type=int, default=5000, help="TCP port to bind (default: 5000)")
-    parser.add_argument("--certfile", required=True, help="Path to PEM-encoded TLS certificate")
-    parser.add_argument("--keyfile", required=True, help="Path to PEM-encoded private key")
     parser.add_argument(
         "--psk",
-        help="Pre-shared key required of all clients (best supplied via env var).",
-    )
-    parser.add_argument(
-        "--psk-file",
-        help="Path to a file containing the pre-shared key (alternative to --psk).",
+        help="Optional pre-shared key to reuse (default: random token generated at startup).",
     )
     parser.add_argument(
         "--log-level",
@@ -248,33 +261,27 @@ def _parse_args() -> argparse.Namespace:
 
 def main() -> None:
     args = _parse_args()
-    psk = _resolve_psk(args.psk, args.psk_file)
+    ensure_gpg_available()
+    psk = _resolve_or_generate_psk(args.psk)
     logging.basicConfig(
         level=getattr(logging, args.log_level),
         format="%(asctime)s %(levelname)s %(message)s",
     )
+    logging.info("Session pre-shared key: %s", psk)
+    print(f"[security] Session pre-shared key: {psk}")
     try:
-        asyncio.run(_run_server(args.host, args.port, args.certfile, args.keyfile, psk))
+        asyncio.run(_run_server(args.host, args.port, psk))
     except KeyboardInterrupt:
         pass
 
 
-def _resolve_psk(psk: Optional[str], psk_file: Optional[str]) -> str:
+def _resolve_or_generate_psk(psk: Optional[str]) -> str:
     if psk:
         value = psk.strip()
         if not value:
-            raise SystemExit("Pre-shared key provided via --psk cannot be empty.")
+            raise SystemExit("Provided pre-shared key cannot be empty.")
         return value
-    if psk_file:
-        path = Path(psk_file)
-        try:
-            value = path.read_text(encoding="utf-8").strip()
-        except OSError as exc:
-            raise SystemExit(f"Unable to read pre-shared key file: {exc}") from exc
-        if not value:
-            raise SystemExit("Pre-shared key file is empty.")
-        return value
-    raise SystemExit("A pre-shared key is required. Provide --psk or --psk-file.")
+    return secrets.token_hex(16)
 
 
 if __name__ == "__main__":
