@@ -21,7 +21,7 @@ Copy the resulting `server.crt` to any client machines so they can verify the se
 ### Running the Server
 
 ```bash
-python server.py --host 0.0.0.0 --port 5000 \
+python pychat_server.py --host 0.0.0.0 --port 5000 \
   --certfile certs/server.crt --keyfile certs/server.key \
   --psk-file secrets/chat.psk
 ```
@@ -31,7 +31,7 @@ By default, the server listens on `127.0.0.1:5000`. Press `Ctrl+C` to shut it do
 ### Running the Client
 
 ```bash
-python client.py --host YOUR_SERVER_IP --port 5000 \
+python pychat_client.py --host YOUR_SERVER_IP --port 5000 \
   --cafile certs/server.crt --psk-file secrets/chat.psk
 ```
 
@@ -60,4 +60,4 @@ python client.py --host YOUR_SERVER_IP --port 5000 \
 
 ### Development Notes
 
-The networking logic lives directly in `server.py` and `client.py`. Feel free to extend them with persistence, authentication, or richer chat commands.
+The networking logic lives directly in `pychat_server.py` and `pychat_client.py`. Feel free to extend them with persistence, authentication, or richer chat commands.

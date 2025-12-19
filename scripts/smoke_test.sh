@@ -22,7 +22,7 @@ echo "[smoke] Ensuring TLS assets and PSK exist..."
 pushd "$PROJECT_ROOT" > /dev/null
 
 echo "[smoke] Starting server in background..."
-$PYTHON_BIN server.py \
+$PYTHON_BIN pychat_server.py \
   --host "$HOST" \
   --port "$PORT" \
   --certfile "$CERT_FILE" \
@@ -83,7 +83,7 @@ echo "[smoke] Using $HOST:$ACTUAL_PORT"
 
 echo "[smoke] Running scripted client interaction..."
 printf "Alice\nHello from the smoke test!\n/quit\n" | \
-  $PYTHON_BIN client.py \
+  $PYTHON_BIN pychat_client.py \
     --host "$HOST" \
     --port "$ACTUAL_PORT" \
     --cafile "$CERT_FILE" \
